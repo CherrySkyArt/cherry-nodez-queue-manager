@@ -94,6 +94,39 @@ async def save_workflows(request):
     return web.json_response({"files": files, "skipped": skipped})
 
 
+@PromptServer.instance.routes.post("/cherry_queue/held/release")
+async def release_held(request):
+    body = await _read_json(request)
+    job_id, client_id = body.get("id"), body.get("client_id")
+    if not is_job_id(job_id):
+        return _bad_request("id must be a job id")
+    error = await manager.release(job_id, client_id if isinstance(client_id, str) else None)
+    if error:
+        return _bad_request(error)
+    return web.json_response({"released": True})
+
+
+@PromptServer.instance.routes.post("/cherry_queue/held/remove")
+async def remove_held(request):
+    body = await _read_json(request)
+    job_id = body.get("id")
+    if not is_job_id(job_id):
+        return _bad_request("id must be a job id")
+    return web.json_response({"removed": manager.remove_held(job_id)})
+
+
+@PromptServer.instance.routes.post("/cherry_queue/saved/workflow")
+async def saved_workflow(request):
+    body = await _read_json(request)
+    entry_id = body.get("id")
+    if not is_job_id(entry_id):
+        return _bad_request("id must be a saved job id")
+    name, workflow, error = manager.saved_workflow(entry_id)
+    if error:
+        return _bad_request(error)
+    return web.json_response({"filename": _safe_filename(name) + ".json", "workflow": workflow})
+
+
 @PromptServer.instance.routes.post("/cherry_queue/saved/requeue")
 async def requeue_saved(request):
     body = await _read_json(request)

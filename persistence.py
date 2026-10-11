@@ -64,7 +64,7 @@ class QueueStore:
         return entries
 
     def load(self):
-        """Saved jobs in queue order, as (job_id, was_running, job or None, error or None)."""
+        """Saved jobs in queue order, as (job_id, was_running, on_hold, job or None, error or None)."""
         index = self._read_index()
         recovering = index is None
         if recovering:
@@ -74,22 +74,23 @@ class QueueStore:
             job_id = entry.get("id")
             if not is_job_id(job_id):
                 continue
-            was_running = bool(entry.get("running"))
+            was_running, on_hold = bool(entry.get("running")), bool(entry.get("held"))
             try:
                 with open(self._job_path(job_id), encoding="utf-8") as f:
                     job = _parse_job(json.load(f))
             except (OSError, ValueError) as e:
-                saved.append((job_id, was_running, None, f"Saved job file is unreadable: {e}"))
+                saved.append((job_id, was_running, on_hold, None, f"Saved job file is unreadable: {e}"))
                 continue
             self._written.add(job_id)
-            saved.append((job_id, was_running, job, None))
+            saved.append((job_id, was_running, on_hold, job, None))
         if recovering:
-            saved.sort(key=lambda s: s[2]["extra_data"].get("create_time", 0) if s[2] else 0)
+            saved.sort(key=lambda s: s[3]["extra_data"].get("create_time", 0) if s[3] else 0)
         return saved
 
-    def save(self, running, pending, next_number):
+    def save(self, running, pending, held, next_number):
         keep, index = set(), []
-        for item, was_running in [(item, True) for item in running] + [(item, False) for item in pending]:
+        tagged = [(item, "running") for item in running] + [(item, "pending") for item in pending] + [(item, "held") for item in held]
+        for item, status in tagged:
             job_id = item[1]
             if job_id in keep or not is_job_id(job_id):
                 continue
@@ -101,7 +102,7 @@ class QueueStore:
                     continue
                 self._written.add(job_id)
             keep.add(job_id)
-            index.append({"id": job_id, "running": was_running})
+            index.append({"id": job_id, "running": status == "running", "held": status == "held"})
         _write_json_atomic(self.index_path, {"version": 1, "next_number": next_number, "jobs": index})
         for name in os.listdir(self.jobs_dir):
             if name.endswith(".json") and name[:-5] not in keep:
@@ -176,12 +177,12 @@ class SavedStore:
         _write_json_atomic(self._path(entry_id), entry)
         self._meta[entry_id] = self._summary(entry_id, entry)
 
-    def add(self, prompt, extra_data, outputs, name, number):
+    def add(self, prompt, extra_data, outputs, name, number, saved_at):
         entry_id = str(uuid.uuid4())
         self._write(entry_id, {
             "name": name,
             "number": number,
-            "saved_at": int(time.time() * 1000),
+            "saved_at": saved_at,
             "prompt": prompt,
             "extra_data": extra_data,
             "outputs_to_execute": outputs,
@@ -189,7 +190,7 @@ class SavedStore:
         return entry_id
 
     def list(self):
-        return sorted(self._meta.values(), key=lambda meta: meta["saved_at"])
+        return sorted(self._meta.values(), key=lambda meta: meta["saved_at"], reverse=True)
 
     def get(self, entry_id):
         return self._read(entry_id) if entry_id in self._meta else None

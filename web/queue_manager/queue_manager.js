@@ -5,6 +5,7 @@ const TAB_ID = "cherry-queue";
 const STATE_EVENT = "cherry_queue.state";
 const EXECUTION_EVENTS = ["execution_start", "execution_success", "execution_error", "execution_interrupted"];
 const SAVE_MODE_KEY = "cherry-queue.save-mode";
+const HOLD_KEY = "cherry_hold"; // must match HOLD_KEY in cherry_queue.py
 
 function loadSaveMode() {
   try {
@@ -20,6 +21,7 @@ const store = {
   paused: false,
   restore: null,
   labels: {},
+  held: [],
   saved: [],
   progress: {},
   connected: true,
@@ -82,6 +84,7 @@ async function refresh() {
     store.paused = state.paused;
     store.restore = state.restore;
     store.labels = state.labels ?? {};
+    store.held = state.held ?? [];
     store.saved = state.saved ?? [];
     store.error = null;
     const runningIds = new Set(store.jobs.filter(isRunning).map((job) => job.id));
@@ -140,6 +143,50 @@ const dismissRestore = () => request("/cherry_queue/dismiss", {});
 const renameJob = (id, name) => request("/cherry_queue/rename", { id, name });
 const requeueSaved = (id) => request("/cherry_queue/saved/requeue", { id, client_id: api.clientId });
 const renameSaved = (id, name) => request("/cherry_queue/saved/rename", { id, name });
+const releaseHeld = (id) => request("/cherry_queue/held/release", { id, client_id: api.clientId });
+const removeHeld = (id) => request("/cherry_queue/held/remove", { id });
+
+async function downloadSaved(id) {
+  const file = await request("/cherry_queue/saved/workflow", { id });
+  downloadJson(file.filename, file.workflow);
+}
+
+async function restoreSaved(id) {
+  const { filename, workflow } = await request("/cherry_queue/saved/workflow", { id });
+  // If the name matches a saved workflow file, ComfyUI opens that file instead, so pick a name nothing uses yet.
+  const base = filename.replace(/\.json$/i, "");
+  const workflows = app.extensionManager.workflow;
+  let name = base;
+  for (let n = 2; workflows?.getWorkflowByPath?.(`workflows/${name}.json`); n++) name = `${base} (${n})`;
+  await app.loadGraphData(workflow, true, true, name);
+}
+
+// Queues the current workflow exactly like the Run button (so seeds still advance and node errors still show),
+// but tags that one /prompt request so the server puts the job on hold instead of in the queue.
+async function queueOnHold() {
+  if (app.processingQueue) throw new Error("A Run is still being sent to the server; try again in a moment");
+  const hadOwn = Object.hasOwn(api, "fetchApi");
+  const original = api.fetchApi;
+  let tagged = false;
+  const wrapper = function (route, options) {
+    if (!tagged && route === "/prompt" && options?.method === "POST" && typeof options.body === "string") {
+      tagged = true;
+      const body = JSON.parse(options.body);
+      body.extra_data = { ...body.extra_data, [HOLD_KEY]: true };
+      options = { ...options, body: JSON.stringify(body) };
+    }
+    return original.call(this, route, options);
+  };
+  api.fetchApi = wrapper;
+  try {
+    await app.queuePrompt(0, 1);
+  } finally {
+    if (api.fetchApi === wrapper) {
+      if (hadOwn) api.fetchApi = original;
+      else delete api.fetchApi;
+    }
+  }
+}
 
 async function deleteSaved(id, name) {
   if (confirm(`Delete the saved job "${name}"?`)) await request("/cherry_queue/saved/delete", { id });
@@ -191,6 +238,11 @@ function describe(job) {
 
 function buildView() {
   const pauseBtn = h("button", { class: "cqm-btn", onclick: () => run(() => setPaused(!store.paused)) });
+  const holdBtn = h("button", {
+    class: "cqm-btn",
+    title: "Queue the current workflow on hold: it waits under On hold and doesn't run until you press its play button",
+    onclick: () => run(queueOnHold),
+  }, h("i", { class: "pi pi-plus" }), "Queue on hold");
   const saveAllBtn = h("button", { class: "cqm-icon-btn pi pi-save", onclick: () => run(() => saveJobs(null)) });
   const modeBtns = {
     list: h("button", { class: "cqm-seg", onclick: () => setSaveMode("list") }, "On server"),
@@ -200,7 +252,7 @@ function buildView() {
   const banner = h("div", { class: "cqm-banner", hidden: true });
   const list = h("div", { class: "cqm-list" });
   const root = h("div", { class: "cqm-root" },
-    h("div", { class: "cqm-header" }, h("span", { class: "cqm-title" }, "Queue"), pauseBtn, saveAllBtn),
+    h("div", { class: "cqm-header" }, h("span", { class: "cqm-title" }, "Queue"), pauseBtn, holdBtn, saveAllBtn),
     h("div", { class: "cqm-mode" }, h("span", { class: "cqm-mode-label" }, "Save to"), modeBtns.list, modeBtns.files),
     status,
     banner,
@@ -234,7 +286,7 @@ function buildView() {
 
     pauseBtn.className = store.paused ? "cqm-btn cqm-btn--paused" : "cqm-btn";
     pauseBtn.replaceChildren(h("i", { class: store.paused ? "pi pi-play" : "pi pi-pause" }), store.paused ? "Resume" : "Pause");
-    saveAllBtn.disabled = store.jobs.length === 0;
+    saveAllBtn.disabled = store.jobs.length === 0 && store.held.length === 0;
     saveAllBtn.title = store.saveMode === "list" ? "Save every job to the Saved list" : "Download every job as its own workflow file";
     for (const [mode, btn] of Object.entries(modeBtns)) btn.classList.toggle("cqm-seg--active", store.saveMode === mode);
 
@@ -244,6 +296,7 @@ function buildView() {
     const rows = [];
     if (running.length) rows.push(h("div", { class: "cqm-section cqm-section--running" }, "Running"), ...running.map(runningRow));
     if (pending.length) rows.push(h("div", { class: "cqm-section cqm-section--pending" }, "Pending"), ...pending.map((job, i) => pendingRow(job, i)));
+    if (store.held.length) rows.push(h("div", { class: "cqm-section cqm-section--held" }, "On hold"), ...store.held.map(heldRow));
     if (!rows.length) rows.push(h("div", { class: "cqm-empty" }, h("i", { class: "pi pi-inbox" }), "The queue is empty"));
     if (store.saved.length) rows.push(h("div", { class: "cqm-section cqm-section--saved" }, "Saved"), ...store.saved.map(savedRow));
     list.replaceChildren(...rows);
@@ -251,7 +304,8 @@ function buildView() {
   }
 
   function renderStatus(runningCount, pendingCount) {
-    let text = `${runningCount} running · ${pendingCount} pending`;
+    const held = store.held.length ? ` · ${store.held.length} on hold` : "";
+    let text = `${runningCount} running · ${pendingCount} pending${held}`;
     let warn = true;
     if (!store.connected) text = "Disconnected, waiting for ComfyUI…";
     else if (store.error) text = `Couldn't load the queue: ${store.error}`;
@@ -372,6 +426,20 @@ function buildView() {
       h("button", { class: "cqm-icon-btn pi pi-times", title: "Remove from queue", onclick: () => run(() => cancelJob(job.id)) }));
   }
 
+  function heldRow(job) {
+    const label = store.labels[job.id];
+    const title = jobName(job.id, label);
+    return h("div", { class: "cqm-row cqm-row--held" },
+      h("i", { class: "cqm-row-icon pi pi-pause-circle" }),
+      h("div", { class: "cqm-row-body" },
+        titleEl(job.id, title, label, renameJob),
+        h("div", { class: "cqm-row-meta" }, defaultName(job.id, label))),
+      renameBtn(job.id, label, renameJob),
+      saveBtn(job.id),
+      h("button", { class: "cqm-icon-btn pi pi-play", title: "Release: add to the end of the queue", onclick: () => run(() => releaseHeld(job.id)) }),
+      h("button", { class: "cqm-icon-btn pi pi-times", title: "Remove", onclick: () => run(() => removeHeld(job.id)) }));
+  }
+
   function savedRow(entry) {
     const title = jobName(entry.id, entry);
     return h("div", { class: "cqm-row" },
@@ -380,7 +448,9 @@ function buildView() {
         titleEl(entry.id, title, entry, renameSaved),
         h("div", { class: "cqm-row-meta" }, defaultName(entry.id, entry))),
       renameBtn(entry.id, entry, renameSaved),
-      h("button", { class: "cqm-icon-btn pi pi-replay", title: "Add to the queue", onclick: () => run(() => requeueSaved(entry.id)) }),
+      h("button", { class: "cqm-icon-btn pi pi-replay", title: "Restore: open in a new workflow tab", onclick: () => run(() => restoreSaved(entry.id)) }),
+      h("button", { class: "cqm-icon-btn pi pi-download", title: "Download as a workflow file", onclick: () => run(() => downloadSaved(entry.id)) }),
+      h("button", { class: "cqm-icon-btn pi pi-play", title: "Add to the queue", onclick: () => run(() => requeueSaved(entry.id)) }),
       h("button", { class: "cqm-icon-btn pi pi-trash", title: "Delete this saved job", onclick: () => run(() => deleteSaved(entry.id, title)) }));
   }
 

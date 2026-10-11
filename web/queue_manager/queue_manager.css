@@ -156,7 +156,9 @@
 .cqm-row--running .cqm-row-icon { color: #4ade80; opacity: 1; }
 .cqm-row--running .cqm-progress-bar { background: #4ade80; }
 .cqm-section--pending { color: #60a5fa; }
+.cqm-section--held { color: var(--cqm-warn); }
 .cqm-section--saved { color: #c084fc; }
+.cqm-row--held .cqm-row-icon { color: var(--cqm-warn); opacity: 1; }
 
 .cqm-row {
   display: flex;
